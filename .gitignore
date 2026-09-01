@@ -1,0 +1,9 @@
+build/
+sdkconfig
+sdkconfig.old
+managed_components/
+.vscode/
+.idea/
+.DS_Store
+tools/monitor/*.log
+__pycache__/

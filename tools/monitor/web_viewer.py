@@ -125,30 +125,33 @@ class DevLink(threading.Thread):
                 continue
             self.rx_bytes += len(data)
             buf += data
+            # 严格顺序解析:报文流 = [STRP 帧 | MON 行]*,只认缓冲区头部的
+            # MAGIC 或 "MON "。绝不在载荷内部搜索——二进制载荷里随机出现的
+            # "MON "/MAGIC 字节序列曾被误当报文边界,裁剪掉真应答导致
+            # do_cmd 超时(动画高频 strip 流下必现)。
             while True:
-                i = buf.find(MAGIC)
-                m = buf.find(b"MON ")
-                if i >= 0 and (m < 0 or i < m):
-                    if len(buf) < i + HDR_LEN:
-                        buf = buf[i:]
-                        break
-                    flags = buf[i + 4]
-                    plen = struct.unpack_from("<H", buf, i + 5)[0]
-                    x1, y1, x2, y2 = struct.unpack_from("<4H", buf, i + 7)
-                    if len(buf) < i + HDR_LEN + plen:
-                        buf = buf[i:]
-                        break
-                    payload = buf[i + HDR_LEN:i + HDR_LEN + plen]
-                    buf = buf[i + HDR_LEN + plen:]
+                if buf.startswith(MAGIC):
+                    if len(buf) < HDR_LEN:
+                        break                                  # 等头部到齐
+                    plen = struct.unpack_from("<H", buf, 5)[0]
+                    if plen > 19200:                            # 超 RLE 上限=假 MAGIC
+                        buf = buf[1:]                           # 丢 1 字节转同步
+                        continue
+                    if len(buf) < HDR_LEN + plen:
+                        break                                  # 等载荷到齐
+                    flags = buf[4]
+                    x1, y1, x2, y2 = struct.unpack_from("<4H", buf, 7)
+                    payload = buf[HDR_LEN:HDR_LEN + plen]
+                    buf = buf[HDR_LEN + plen:]
                     self.strips += 1
                     self._paint(flags & 1, x1, y1, x2, y2, payload)
-                elif m >= 0:
-                    nl = buf.find(b"\n", m)
+                elif buf.startswith(b"MON "):
+                    nl = buf.find(b"\n")
                     if nl < 0:
-                        if len(buf) > 8192:
-                            buf = buf[-64:]
-                        break
-                    line = buf[m:nl].decode("utf-8", "replace")
+                        if len(buf) > 8192:                     # 病态长行防线
+                            buf = b""
+                        break                                   # 等行尾到齐
+                    line = buf[:nl].decode("utf-8", "replace")
                     buf = buf[nl + 1:]
                     # 连接握手自发的 M 1 会先产生一条应答,不进命令队列,否则第一条
                     # 用户命令的响应配对错位。仅丢这一条——用户后续 M 0/M 1 的
@@ -158,9 +161,15 @@ class DevLink(threading.Thread):
                         continue
                     self.resp_q.put(line)
                 else:
-                    if len(buf) > 16:
-                        buf = buf[-16:]
-                    break
+                    # 头部乱流(启动日志等)→ 转同步:跳到下一个候选起点。
+                    # MAGIC=4B、"\nMON "=5B,跨读边界至多各缺 4B,留尾 8B 防劈。
+                    j = buf.find(MAGIC, 1)
+                    k = buf.find(b"\nMON ")
+                    k = k + 1 if k >= 0 else -1
+                    if j < 0 and k < 0:
+                        buf = buf[-8:] if len(buf) > 8 else buf
+                        break
+                    buf = buf[k:] if (k >= 0 and (j < 0 or k < j)) else buf[j:]
 
     def _paint(self, rle, x1, y1, x2, y2, payload):
         w, h = x2 - x1 + 1, y2 - y1 + 1

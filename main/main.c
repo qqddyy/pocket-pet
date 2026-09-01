@@ -115,6 +115,7 @@ static void do_action(void)
         beep_full();
         return;
     }
+    pet_ui_pet_react();             // 开心蹦(互动成功的动效反馈)
     switch (act) {                   // 音效随互动类型
     case PET_ACT_FEED:  beep_feed();  break;
     case PET_ACT_CLEAN: beep_clean(); break;

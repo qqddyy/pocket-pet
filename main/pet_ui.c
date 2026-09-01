@@ -5,6 +5,7 @@
 // 眼睛+心情嘴形(微笑弧/平嘴/沮丧弧),阶段或心情档位变化时才重建,避免闪烁。
 #include "pet_ui.h"
 
+#include <math.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -40,12 +41,23 @@ static lv_obj_t *stat_bar[3];
 static lv_obj_t *status_rows[9];
 static lv_obj_t *menu_rows[5];
 
-// 宠物形象部件池(都挂在 s_page 上;嘴固定是最后一个,便于单独换表情)
+// 宠物形象部件池(都挂在 s_face 容器上;嘴固定是最后一个,便于单独换表情)
 #define FACE_PART_MAX 6
 static lv_obj_t *f_parts[FACE_PART_MAX];
 static int       f_part_cnt;
 static int       s_face_stage = -1;   // -1 = 未建
 static int       s_mood_tier  = -1;   // -1 = 未建(蛋无表情);2 微笑 1 平嘴 0 沮丧
+
+// 动效:形象整体挂在 s_face 容器上,移动/旋转只动这一个对象;
+// timer 定随机节奏,lv_anim 在 LVGL 任务上下文(持锁)跑,创建/删除均在锁内路径。
+static lv_obj_t   *s_face;              // 形象容器
+static lv_timer_t *s_walk_timer;        // 待机溜达节拍(幼年/成年)
+static lv_timer_t *s_blink_timer;       // 随机眨眼节拍(幼年/成年)
+static lv_timer_t *s_blink_restore;     // 眨眼复原一次性 timer
+static lv_timer_t *s_wobble_timer;      // 蛋摇摆节拍(蛋)
+static int         s_eye_idx[2];        // 两眼在 f_parts 的下标
+static lv_point_t  s_eye_pos[2];        // 两眼左上角坐标(压扁后复原用)
+static int16_t     s_eye_d;             // 眼睛直径
 
 static lv_obj_t *label_new(const char *text, int x, int y, int w, lv_align_t align)
 {
@@ -116,11 +128,11 @@ static lv_obj_t *title_new(const char *text, int y)
 
 // ---------------- 宠物形象(基础图元拼装) ----------------
 
-// 实心圆(自动登记进部件池)
+// 实心圆(自动登记进部件池,挂 s_face 容器)
 static lv_obj_t *circle_new(int cx, int cy, int d, uint32_t color)
 {
     if (f_part_cnt >= FACE_PART_MAX) return NULL;
-    lv_obj_t *o = lv_obj_create(s_page);
+    lv_obj_t *o = lv_obj_create(s_face);
     lv_obj_set_size(o, d, d);
     lv_obj_set_pos(o, cx - d / 2, cy - d / 2);
     lv_obj_set_style_radius(o, LV_RADIUS_CIRCLE, 0);
@@ -137,7 +149,7 @@ static lv_obj_t *circle_new(int cx, int cy, int d, uint32_t color)
 static lv_obj_t *oval_new(int cx, int cy, int w, int h, uint32_t color)
 {
     if (f_part_cnt >= FACE_PART_MAX) return NULL;
-    lv_obj_t *o = lv_obj_create(s_page);
+    lv_obj_t *o = lv_obj_create(s_face);
     lv_obj_set_size(o, w, h);
     lv_obj_set_pos(o, cx - w / 2, cy - h / 2);
     lv_obj_set_style_radius(o, w / 2, 0);
@@ -155,7 +167,7 @@ static lv_obj_t *mouth_new(int cx, int cy, int d, int tier)
 {
     if (f_part_cnt >= FACE_PART_MAX) return NULL;
     if (tier == 1) {   // 平嘴:小横条
-        lv_obj_t *o = lv_obj_create(s_page);
+        lv_obj_t *o = lv_obj_create(s_face);
         lv_obj_set_size(o, d * 8 / 20, 4);
         lv_obj_set_pos(o, cx - d * 8 / 40, cy - 2);
         lv_obj_set_style_radius(o, 2, 0);
@@ -166,7 +178,7 @@ static lv_obj_t *mouth_new(int cx, int cy, int d, int tier)
         f_parts[f_part_cnt++] = o;
         return o;
     }
-    lv_obj_t *a = lv_arc_create(s_page);
+    lv_obj_t *a = lv_arc_create(s_face);
     lv_obj_set_size(a, d, d);
     lv_obj_set_pos(a, cx - d / 2, cy - d / 2);
     lv_arc_set_rotation(a, 0);
@@ -190,43 +202,201 @@ static int mood_tier_of(int mood)
     return mood >= 70 ? 2 : (mood >= 40 ? 1 : 0);
 }
 
-static void face_destroy(void)
+// ---------------- 动效(anim exec 回调运行于 LVGL 任务,lvgl_port 已持锁) ----------------
+// 设计:所有位移/旋转只动 s_face 容器一个对象,部件随容器整体动。
+// anim 以 (var, exec_cb) 为身份,不同动效用不同 exec_cb,可精确增删不误伤。
+
+// 溜达 x:线性位移(速度 40px/s),ready 里收掉步态蹦跳
+static void walk_x_exec_cb(void *var, int32_t v) { lv_obj_set_x((lv_obj_t *)var, v); }
+
+// 溜达 y:单次 260ms 一蹦(0→-6→0,sin 半波),无限重复
+static void walk_y_exec_cb(void *var, int32_t v)
 {
-    for (int i = 0; i < f_part_cnt; i++) {
-        if (f_parts[i]) lv_obj_delete(f_parts[i]);
-        f_parts[i] = NULL;
-    }
-    f_part_cnt    = 0;
-    s_face_stage  = -1;
-    s_mood_tier   = -1;
+    lv_obj_set_y((lv_obj_t *)var, (int32_t)(-6.0f * sinf((float)M_PI * v / 100.0f)));
 }
 
-// 按阶段重建整张脸(切阶段时调用)
+static void walk_x_ready_cb(lv_anim_t *a)
+{
+    lv_anim_delete(a->var, walk_y_exec_cb);   // 到站,停蹦
+    lv_obj_set_y((lv_obj_t *)a->var, 0);
+}
+
+// 开心蹦:0→-14→0,350ms(互动成功反馈)
+static void react_exec_cb(void *var, int32_t v)
+{
+    lv_obj_set_y((lv_obj_t *)var, (int32_t)(-14.0f * sinf((float)M_PI * v / 100.0f)));
+}
+static void react_ready_cb(lv_anim_t *a) { lv_obj_set_y((lv_obj_t *)a->var, 0); }
+
+// 蛋摇摆:v 为 0..100 进度(700ms)。⚠ 不用容器旋转——transform 走 LVGL 软件分层
+// 渲染(ARGB 中间层+逐条旋转混合),240x170 区域在 C3+40KB 池上直接把渲染任务拖死
+// (实测整机失去响应)。改用平移摇晃:左右摆 ±4px 两周期 + 中途微抬 3px,
+// 与溜达同款 invalidate 机制,开销恒定。
+static int32_t s_wobble_base_x;   // 摇摆起始 x(结束后归位)
+
+static void wobble_exec_cb(void *var, int32_t v)
+{
+    const float t  = v / 100.0f;
+    const int sway = (int32_t)(4.0f * sinf(4.0f * (float)M_PI * t));          // 左右两摆
+    const int lift = (int32_t)(-1.5f * (1.0f - cosf(2.0f * (float)M_PI * t))); // 单次微抬
+    lv_obj_set_x((lv_obj_t *)var, s_wobble_base_x + sway);
+    lv_obj_set_y((lv_obj_t *)var, lift);
+}
+static void wobble_ready_cb(lv_anim_t *a)
+{
+    lv_obj_set_x((lv_obj_t *)a->var, s_wobble_base_x);
+    lv_obj_set_y((lv_obj_t *)a->var, 0);
+}
+
+// 溜达节拍:随机 2.5~5s 发起一次;沮丧(心情<40)趴窝不动
+static void walk_timer_cb(lv_timer_t *t)
+{
+    lv_timer_set_period(t, 2500 + pet_rand() % 2500);
+    if (!s_face || !s_st || s_st->mood < 40) return;
+    if (lv_anim_get(s_face, walk_x_exec_cb)) return;   // 已在走
+    if (lv_anim_get(s_face, react_exec_cb)) return;    // 蹦跳中不打断
+
+    const int32_t cur = lv_obj_get_x(s_face);
+    const int32_t target = -60 + (int32_t)(pet_rand() % 121);   // 中心 x ∈ [60,180]
+    if (target == cur) return;
+    const int32_t dist = target > cur ? target - cur : cur - target;
+
+    lv_anim_t a;
+    lv_anim_init(&a);
+    lv_anim_set_var(&a, s_face);
+    lv_anim_set_values(&a, cur, target);
+    lv_anim_set_duration(&a, dist * 1000 / 40);
+    lv_anim_set_exec_cb(&a, walk_x_exec_cb);
+    lv_anim_set_path_cb(&a, lv_anim_path_linear);
+    lv_anim_set_ready_cb(&a, walk_x_ready_cb);
+    lv_anim_start(&a);
+
+    // 蹦跳步态与 x 平行跑,到站由 walk_x_ready_cb 收掉
+    lv_anim_init(&a);
+    lv_anim_set_var(&a, s_face);
+    lv_anim_set_values(&a, 0, 100);
+    lv_anim_set_duration(&a, 260);
+    lv_anim_set_exec_cb(&a, walk_y_exec_cb);
+    lv_anim_set_path_cb(&a, lv_anim_path_linear);
+    lv_anim_set_repeat_count(&a, LV_ANIM_REPEAT_INFINITE);
+    lv_anim_start(&a);
+}
+
+// 眨眼复原:眼睛尺寸/位置还原
+static void blink_restore_cb(lv_timer_t *t)
+{
+    for (int i = 0; i < 2; i++) {
+        lv_obj_t *e = f_parts[s_eye_idx[i]];
+        if (!e) continue;
+        lv_obj_set_size(e, s_eye_d, s_eye_d);
+        lv_obj_set_pos(e, s_eye_pos[i].x, s_eye_pos[i].y);
+    }
+    s_blink_restore = NULL;
+    lv_timer_delete(t);
+}
+
+// 眨眼节拍:随机 2~6s;眼睛压到 2px 高(垂直居中),120ms 后复原
+static void blink_timer_cb(lv_timer_t *t)
+{
+    lv_timer_set_period(t, 2000 + pet_rand() % 4000);
+    if (!s_face) return;
+    for (int i = 0; i < 2; i++) {
+        lv_obj_t *e = f_parts[s_eye_idx[i]];
+        if (!e) continue;
+        lv_obj_set_size(e, s_eye_d, 2);
+        lv_obj_set_pos(e, s_eye_pos[i].x, s_eye_pos[i].y + (s_eye_d - 2) / 2);
+    }
+    s_blink_restore = lv_timer_create(blink_restore_cb, 120, NULL);
+    lv_timer_set_repeat_count(s_blink_restore, 1);
+}
+
+// 蛋摇摆节拍:随机 4~8s
+static void wobble_timer_cb(lv_timer_t *t)
+{
+    lv_timer_set_period(t, 4000 + pet_rand() % 4000);
+    if (!s_face || lv_anim_get(s_face, wobble_exec_cb)) return;
+    s_wobble_base_x = lv_obj_get_x(s_face);   // 蛋不溜达,恒为 0,稳妥起见仍取实际值
+
+    lv_anim_t a;
+    lv_anim_init(&a);
+    lv_anim_set_var(&a, s_face);
+    lv_anim_set_values(&a, 0, 100);
+    lv_anim_set_duration(&a, 700);
+    lv_anim_set_exec_cb(&a, wobble_exec_cb);
+    lv_anim_set_path_cb(&a, lv_anim_path_linear);
+    lv_anim_set_ready_cb(&a, wobble_ready_cb);
+    lv_anim_start(&a);
+}
+
+// 停掉全部动效节拍与动画(切页/换阶段前必须调,防悬垂:
+// LVGL 9 删对象不会自动删挂在其上的用户 anim)
+static void anims_stop(void)
+{
+    if (s_walk_timer)   { lv_timer_delete(s_walk_timer);   s_walk_timer = NULL; }
+    if (s_blink_timer)  { lv_timer_delete(s_blink_timer);  s_blink_timer = NULL; }
+    if (s_wobble_timer) { lv_timer_delete(s_wobble_timer); s_wobble_timer = NULL; }
+    if (s_blink_restore) { lv_timer_delete(s_blink_restore); s_blink_restore = NULL; }
+    if (s_face) lv_anim_delete(s_face, NULL);   // x/y 步态/蹦/摇摆全收
+}
+
+static void face_destroy(void)
+{
+    anims_stop();
+    if (s_face) {
+        lv_obj_delete(s_face);   // 部件随容器一起销毁
+        s_face = NULL;
+    }
+    memset(f_parts, 0, sizeof(f_parts));
+    f_part_cnt   = 0;
+    s_face_stage = -1;
+    s_mood_tier  = -1;
+}
+
+// 按阶段重建整张脸(切阶段时调用):先建容器,再拼部件,最后挂动效节拍
 static void face_rebuild(pet_stage_t stage, int mood)
 {
     face_destroy();
     s_face_stage = (int)stage;
+
+    // 形象容器:透明,只作整体移动/旋转的载体
+    s_face = lv_obj_create(s_page);
+    lv_obj_set_size(s_face, 240, 170);
+    lv_obj_set_pos(s_face, 0, 0);
+    lv_obj_set_style_border_width(s_face, 0, 0);
+    lv_obj_set_style_pad_all(s_face, 0, 0);
+    lv_obj_set_style_radius(s_face, 0, 0);
+    lv_obj_set_style_bg_opa(s_face, LV_OPA_TRANSP, 0);
+    lv_obj_remove_flag(s_face, LV_OBJ_FLAG_SCROLLABLE);
 
     if (stage == PET_EGG) {
         // 蛋:奶油色胶囊 + 两枚浅斑;无表情,状态由三维条表达
         oval_new(120, 102, 62, 78, C_EGG);
         circle_new(106, 88, 8, C_SPOT);
         circle_new(134, 114, 8, C_SPOT);
+        s_wobble_timer = lv_timer_create(wobble_timer_cb, 4000 + pet_rand() % 4000, NULL);
         return;
     }
     if (stage == PET_BABY) {
         circle_new(120, 102, 72, C_BODY);
-        circle_new(107, 92, 8, C_FACE);
-        circle_new(133, 92, 8, C_FACE);
+        s_eye_idx[0] = f_part_cnt; circle_new(107, 92, 8, C_FACE);
+        s_eye_idx[1] = f_part_cnt; circle_new(133, 92, 8, C_FACE);
+        s_eye_d = 8;
+        s_eye_pos[0].x = 107 - 4; s_eye_pos[0].y = 92 - 4;
+        s_eye_pos[1].x = 133 - 4; s_eye_pos[1].y = 92 - 4;
         s_mood_tier = mood_tier_of(mood);
         mouth_new(120, 104, 22, s_mood_tier);
     } else {   // PET_ADULT
         circle_new(120, 104, 92, C_BODY);
-        circle_new(101, 88, 10, C_FACE);
-        circle_new(139, 88, 10, C_FACE);
+        s_eye_idx[0] = f_part_cnt; circle_new(101, 88, 10, C_FACE);
+        s_eye_idx[1] = f_part_cnt; circle_new(139, 88, 10, C_FACE);
+        s_eye_d = 10;
+        s_eye_pos[0].x = 101 - 5; s_eye_pos[0].y = 88 - 5;
+        s_eye_pos[1].x = 139 - 5; s_eye_pos[1].y = 88 - 5;
         s_mood_tier = mood_tier_of(mood);
         mouth_new(120, 108, 28, s_mood_tier);
     }
+    s_walk_timer  = lv_timer_create(walk_timer_cb, 2500 + pet_rand() % 2500, NULL);
+    s_blink_timer = lv_timer_create(blink_timer_cb, 2000 + pet_rand() % 4000, NULL);
 }
 
 // 仅换嘴(心情档位变化时;嘴是部件池最后一个,单独换避免整脸重建闪烁)
@@ -463,6 +633,25 @@ void pet_ui_banner(const char *text)
     s_banner_timer = lv_timer_create(banner_timeout_cb, 1500, NULL);
     lv_timer_set_repeat_count(s_banner_timer, 1);
     lv_timer_reset(s_banner_timer);   // 立即就绪
+}
+
+void pet_ui_pet_react(void)
+{
+    if (s_page_id != PAGE_PET || !s_face) return;
+    // 走路中先停(下次 walk 节拍从当前位置续走),防两套 y 动画打架
+    lv_anim_delete(s_face, walk_x_exec_cb);
+    lv_anim_delete(s_face, walk_y_exec_cb);
+    if (lv_anim_get(s_face, react_exec_cb)) return;   // 已在蹦:不叠加
+
+    lv_anim_t a;
+    lv_anim_init(&a);
+    lv_anim_set_var(&a, s_face);
+    lv_anim_set_values(&a, 0, 100);
+    lv_anim_set_duration(&a, 350);
+    lv_anim_set_exec_cb(&a, react_exec_cb);
+    lv_anim_set_path_cb(&a, lv_anim_path_linear);
+    lv_anim_set_ready_cb(&a, react_ready_cb);
+    lv_anim_start(&a);
 }
 
 void pet_ui_refresh(void)
